@@ -4,6 +4,7 @@ out/
 !**/src/test/**/out/
 *.iml
 *.xml
+!simple-server.iml
 
 ### Eclipse ###
 .apt_generated
