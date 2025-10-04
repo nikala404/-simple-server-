@@ -1,31 +1,63 @@
+import com.sun.management.OperatingSystemMXBean;
+
+import java.lang.management.ManagementFactory;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
-import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 public class LoadTestClient {
     // Thread-safe counters for tracking results across multiple threads
     private static final AtomicInteger successCount = new AtomicInteger(0);
     private static final AtomicInteger errorCount = new AtomicInteger(0);
     private static final AtomicInteger totalRequests = new AtomicInteger(0);
-    private static volatile long totalResponseTime = 0;
-    private static volatile long minResponseTime = Long.MAX_VALUE;
-    private static volatile long maxResponseTime = 0;
+    private static volatile double totalResponseTime = 0;
+    private static volatile double minResponseTime = Long.MAX_VALUE;
+    private static volatile double maxResponseTime = 0;
     private static volatile boolean running = true; // Flag to stop threads
-    private static final ConcurrentSkipListSet<Long> responseTimes = new ConcurrentSkipListSet<>();
+    private static final List<Double> responseTimes = Collections.synchronizedList(new ArrayList<>());
+    static final int CONCURRENT_USERS = 5;
+    static final int TEST_DURATION_SECONDS = 10;
+    static double cpuUsage;
+
 
     public static void main(String[] args) throws Exception {
-        System.out.println("Starting performance test - measuring server metrics...");
-        long startTime = System.currentTimeMillis();
-        final int CONCURRENT_USERS = 5;
-        final int TEST_DURATION_SECONDS = 10;
 
+        if (checkServerRunning()) {
+            System.out.println("✓ Server is already running on port 8080");
+        } else {
+
+            System.out.println("Server is not running. Starting embedded server...");
+
+            new Thread(() -> {
+                try {
+                    Server.main(null);
+                } catch (Exception e) {
+                    System.err.println("Failed to start server: " + e.getMessage());
+                }
+            }, "Embedded-Server-Thread").start();
+
+            int attempts = 0;
+            while (attempts < 3) {
+                Thread.sleep(500); // Wait 500ms between checks
+                if (checkServerRunning()) {
+                    Server.setRunning(true);
+                    System.out.println("✓ Embedded server started successfully");
+                    break;
+                }
+                attempts++;
+            }
+        }
+        long startTime = System.currentTimeMillis();
         // Create thread pool with concurrent users
         try (ExecutorService executor = Executors.newFixedThreadPool(CONCURRENT_USERS)) {
             for (int i = 0; i < CONCURRENT_USERS; i++) {
@@ -44,15 +76,15 @@ public class LoadTestClient {
 
                                 HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
 
-                                // Calculate response time in milliseconds
-                                long respTimeMs = (System.nanoTime() - reqStart) / 1_000_000;
+                                // Calculate response time in Nanos
+                                double respTimeNanos = (double) (System.nanoTime() - reqStart);
 
                                 // Update metrics atomically
                                 synchronized (LoadTestClient.class) {
-                                    totalResponseTime += respTimeMs;
-                                    if (respTimeMs < minResponseTime) minResponseTime = respTimeMs;
-                                    if (respTimeMs > maxResponseTime) maxResponseTime = respTimeMs;
-                                    responseTimes.add(respTimeMs);
+                                    totalResponseTime += respTimeNanos;
+                                    if (respTimeNanos < minResponseTime) minResponseTime = respTimeNanos;
+                                    if (respTimeNanos > maxResponseTime) maxResponseTime = respTimeNanos;
+                                    responseTimes.add(respTimeNanos);
                                 }
 
                                 totalRequests.incrementAndGet();
@@ -74,59 +106,85 @@ public class LoadTestClient {
                 });
             }
 
+
             // Run test for specified duration
             Thread.sleep(Duration.ofSeconds(TEST_DURATION_SECONDS).toMillis());
+            OperatingSystemMXBean osBean = (com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
+            cpuUsage = osBean.getProcessCpuLoad() * 100.0;
             running = false;
             executor.shutdown();
 
-            try {
-                System.out.println("Test completed. Waiting for users to finish their last requests...");
-                if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
-                    executor.shutdownNow();
-                }
-            } catch (InterruptedException e) {
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
                 executor.shutdownNow();
-                Thread.currentThread().interrupt();
             }
         }
 
+        printResults(startTime);
+    }
+
+    private static double nanoToMs(double nanos) {
+        return nanos / 1_000_000.0;
+    }
+
+    private static boolean checkServerRunning() {
+        try (HttpClient client = HttpClient.newHttpClient()) {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("http://localhost:8080/health"))
+                    .timeout(Duration.ofSeconds(2))
+                    .GET()
+                    .build();
+
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            return response.statusCode() == 200;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static void printResults(long startTime) {
         long duration = System.currentTimeMillis() - startTime;
         int totalReqs = totalRequests.get();
-        long usedMemory = (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / 1024 / 1024;
+        long usedMemory = (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / (1024 * 1024);
 
-        long medianResponseTime = 0;
-        if (!responseTimes.isEmpty()) {
-            Object[] sortedTimes = responseTimes.toArray();
-            medianResponseTime = (long) sortedTimes[sortedTimes.length / 2];
-        }
+        double medianResponseTimeMs = responseTimes.isEmpty() ? 0 :
+                nanoToMs(
+                        responseTimes.stream()
+                                .sorted()
+                                .collect(Collectors.collectingAndThen(Collectors.toList(), list -> {
+                                    int mid = list.size() / 2;
+                                    return list.size() % 2 == 0
+                                            ? (list.get(mid - 1) + list.get(mid)) / 2
+                                            : list.get(mid);
+                                }))
+                );
 
-        System.out.println("\n====== PERFORMANCE TEST RESULTS ======");
-        System.out.println("Test Duration: " + duration / 1000.0 + " seconds");
-        System.out.println("Concurrent Users: " + CONCURRENT_USERS);
+        StringBuilder results = new StringBuilder();
+        results.append("\n====== PERFORMANCE TEST RESULTS ======\n");
+        results.append(String.format("Test Duration: %.1f seconds\n", duration / 1000.0));
+        results.append(String.format("Concurrent Users: %d\n", CONCURRENT_USERS));
 
-        System.out.println("\n--- REQUEST METRICS ---");
-        System.out.println("Total Requests: " + totalReqs);
-        System.out.println("Successful Requests: " + successCount.get());
-        System.out.println("Failed Requests: " + errorCount.get());
-        System.out.println("Success Rate: " + (totalReqs > 0 ? (successCount.get() * 100.0 / totalReqs) : 0) + "%");
+        results.append("\n--- REQUEST METRICS ---\n");
+        results.append(String.format("Total Requests: %d\n", totalReqs));
+        results.append(String.format("Successful Requests: %d\n", successCount.get()));
+        results.append(String.format("Failed Requests: %d\n", errorCount.get()));
+        results.append(String.format("Success Rate: %.2f%%\n", totalReqs > 0 ? (successCount.get() * 100.0 / totalReqs) : 0));
 
         if (totalReqs > 0) {
-            System.out.println("Response Time (Average): " + (totalResponseTime / totalReqs) + " ms");
-            System.out.println("Response Time (Min): " + (minResponseTime == Long.MAX_VALUE ? "N/A" : minResponseTime + " ms"));
-            System.out.println("Response Time (Max): " + maxResponseTime + " ms");
-            System.out.println("Response Time (Median): " + medianResponseTime + " ms");
+            results.append(String.format("Response Time (Average): %.3f ms\n", nanoToMs(totalResponseTime) / totalReqs));
+            results.append(String.format("Response Time (Min): %.3f ms\n", minResponseTime == Double.MAX_VALUE ? 0 : nanoToMs(minResponseTime)));
+            results.append(String.format("Response Time (Max): %.3f ms\n", nanoToMs(maxResponseTime)));
+            results.append(String.format("Response Time (Median): %.3f ms\n", medianResponseTimeMs));
         } else {
-            System.out.println("Response Time: N/A (no requests completed)");
+            results.append("Response Time: N/A (no requests completed)\n");
         }
 
-        System.out.println("\n=== Analyze ===");
-        System.out.println("Server can handle ~" + String.format("%.2f", totalReqs / (duration / 1000.0)) + " requests/second");
-        System.out.println("Memory footprint: " + usedMemory + "MB under " + totalReqs + " requests");
-        System.out.println("Thread utilization: Efficient with" + CONCURRENT_USERS + "concurrent users");
+        double rps = totalReqs / (duration / 1000.0);
+        results.append("\n=== SERVER PERFORMANCE ANALYSIS ===\n");
+        results.append(String.format("Server throughput: %.2f requests/second\n", rps));
+        results.append(String.format("Memory footprint: %dMB\n", usedMemory));
+        results.append(String.format("CPU usage: %.2f%%\n", cpuUsage));
 
-        System.out.println("\n=== HARDWARE REQUIREMENTS ===");
-        System.out.println("CPU: Minimal usage for this workload");
-        System.out.println("RAM: " + usedMemory + "MB + ~2MB per 100 RPS");
-        System.out.println("Recommended: 1 CPU core, 128MB RAM for 100 RPS");
+        System.out.print(results);
     }
+
 }

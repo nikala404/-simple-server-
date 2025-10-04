@@ -13,6 +13,8 @@ public class RequestHandler implements HttpHandler {
 
             if ("POST".equals(method)) {
                 handlePostRequest(exchange);
+            } else if ("GET".equals(method)) {
+                handleHealthCheck(exchange);
             } else {
                 //Method Not Allowed For Other Type Of Requests
                 String response = "{\"error\":\"Method not allowed\"}";
@@ -62,5 +64,14 @@ public class RequestHandler implements HttpHandler {
             os.write(errorResponse.getBytes());
             os.close();
         }
+    }
+
+    private void handleHealthCheck(HttpExchange exchange) throws IOException {
+        String response = "{\"status\":\"ok\"}";
+        exchange.getResponseHeaders().set("Content-Type", "application/json");
+        exchange.sendResponseHeaders(200, response.length());
+        OutputStream os = exchange.getResponseBody();
+        os.write(response.getBytes());
+        os.close();
     }
 }

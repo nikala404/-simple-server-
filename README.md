@@ -11,9 +11,8 @@ It also includes a lightweight load testing client to simulate concurrent users.
 
 ## How to Run
 
-### 1. Compile the project
-### 2. Start the server  {Server.java}
-### 3. Run the load test client {LoadTestClient.java}
+### 1. Start the server  {Server.java}
+### 2. Run the load test client {LoadTestClient.java}
 
 ##  Notes
 ```
